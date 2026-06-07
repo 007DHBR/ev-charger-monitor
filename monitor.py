@@ -175,12 +175,10 @@ def check_once():
         prev_status = prev.get('status', 'Unknown')
         print(f'[{cid}] {prev_status} -> {status}')
 
-        # Track when charging actually started
         if status == 'Charging' and prev_status != 'Charging':
             prev['charge_start_ts'] = now_ts
             print(f'[{cid}] charge_start_ts recorded')
 
-        # While charging, snapshot session data
         if status == 'Charging':
             session = get_active_session(cid)
             if session:
@@ -197,7 +195,6 @@ def check_once():
         ctype = 'DC Fast' if cid.startswith('DC') else 'AC'
         time_str = sl_now_str()
 
-        # Vehicle plugged in
         if status == 'Preparing' and prev_status not in ('Charging',):
             notify(
                 title=f'\u26a1 {cid} - Vehicle Plugged In',
@@ -206,7 +203,6 @@ def check_once():
                 priority='high'
             )
 
-        # Charging started
         elif status == 'Charging' and prev_status != 'Charging':
             notify(
                 title=f'\u26a1 {cid} - Charging Started',
@@ -215,7 +211,6 @@ def check_once():
                 priority='high'
             )
 
-        # Session ended — check if it was suspiciously short (BMS error)
         elif status in ('Finishing', 'Available') and prev_status in ('Charging', 'Finishing', 'Preparing'):
             charge_start_ts = prev.get('charge_start_ts')
             session_duration = (now_ts - charge_start_ts) if charge_start_ts else None
@@ -224,20 +219,20 @@ def check_once():
             kwh    = extract_kwh(session)    or prev.get('last_kwh')
             profit = extract_profit(session) or prev.get('last_profit')
 
-            # BMS / fault: charged for less than threshold and barely any kWh
+            # BMS/fault: session ended under threshold regardless of kWh — even 0.0 kWh counts
             is_bms_error = (
                 session_duration is not None and
-                session_duration < BMS_ERROR_THRESHOLD_SECONDS and
-                (kwh is None or kwh < 0.5)
+                session_duration < BMS_ERROR_THRESHOLD_SECONDS
             )
 
             if is_bms_error:
                 duration_str = f'{int(session_duration)}s' if session_duration else 'unknown'
+                kwh_str = f'{kwh} kWh' if kwh else '0 kWh'
                 notify(
                     title=f'\u26a0\ufe0f {cid} - BMS ERROR / Fault Detected',
                     body=(
                         f'WARNING: {ctype} charger {cid} stopped unexpectedly!\n'
-                        f'Session ended only {duration_str} after charging started.\n'
+                        f'Session lasted only {duration_str} — {kwh_str} delivered.\n'
                         f'Possible cause: Vehicle BMS error, connector fault, or charger issue.\n'
                         f'Action needed: Check the charger screen.\n'
                         f'Time: {time_str}'
@@ -263,7 +258,6 @@ def check_once():
                 if profit: state['daily']['profit'] = round(state['daily']['profit'] + profit, 2)
                 state['daily']['sessions'] += 1
 
-            # Clean up session tracking
             state[cid].pop('last_kwh', None)
             state[cid].pop('last_profit', None)
             state[cid].pop('charge_start_ts', None)
@@ -275,7 +269,6 @@ def check_once():
                 priority='default', tags='wave'
             )
 
-    # 9pm Sri Lanka daily summary
     if sl_hour() == 21 and not state['daily'].get('summary_sent'):
         d = state['daily']
         today_str = datetime.now(SL_TZ).strftime('%d %b %Y')
