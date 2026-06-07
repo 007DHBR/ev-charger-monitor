@@ -24,8 +24,6 @@ API_BASES = [
 _token = None
 _base  = None
 
-# ── Auth ─────────────────────────────────────────────────────────────────────
-
 def login():
     global _token, _base
     for base in API_BASES:
@@ -46,8 +44,6 @@ def login():
                 print(f'[login] {base}{path}: {e}')
     return False
 
-# ── API ───────────────────────────────────────────────────────────────────────
-
 def get_charger_status():
     r = requests.get(f'{_base}/charger/getChargerStatus/{STATION_ID}',
         headers={'Authorization': f'Bearer {_token}'},
@@ -65,8 +61,6 @@ def get_active_session(cid):
                 return data
     except: pass
     return None
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def extract_kwh(session):
     if not session or not isinstance(session, dict): return None
@@ -86,8 +80,6 @@ def extract_revenue(session):
             except: pass
     return None
 
-# ── Notifications ─────────────────────────────────────────────────────────────
-
 def notify(title, body, tags='electric_plug', priority='high'):
     try:
         r = requests.post(f'https://ntfy.sh/{NTFY_TOPIC}',
@@ -99,8 +91,6 @@ def notify(title, body, tags='electric_plug', priority='high'):
     except Exception as e:
         print(f'[notify] error: {e}')
 
-# ── State ─────────────────────────────────────────────────────────────────────
-
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f: return json.load(f)
@@ -108,6 +98,9 @@ def load_state():
 
 def save_state(state):
     with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
+
+def sl_now_str():
+    return datetime.now(SL_TZ).strftime('%I:%M %p')
 
 def sl_today():
     return datetime.now(SL_TZ).strftime('%Y-%m-%d')
@@ -126,8 +119,6 @@ def ensure_daily(state):
             'summary_sent': False,
         }
     return state
-
-# ── Core check ───────────────────────────────────────────────────────────────
 
 def check_once():
     chargers_raw = get_charger_status()
@@ -153,7 +144,7 @@ def check_once():
         prev_status = prev.get('status', 'Unknown')
         print(f'[{cid}] {prev_status} -> {status}')
 
-        # While charging, keep refreshing session snapshot so we have data when it ends
+        # While charging, keep refreshing session snapshot
         if status == 'Charging':
             session = get_active_session(cid)
             if session:
@@ -168,19 +159,27 @@ def check_once():
             continue
 
         ctype = 'DC Fast' if cid.startswith('DC') else 'AC'
+        time_str = sl_now_str()
 
-        # ── Plug-in / start ───────────────────────────────────────────────
-        if status in ('Preparing', 'Charging'):
-            action = 'started charging' if status == 'Charging' else 'plugged in'
+        # Vehicle plugged in — connector is preparing
+        if status == 'Preparing' and prev_status not in ('Charging',):
             notify(
-                title=f'EV {cid} - Vehicle {action}',
-                body=f'{ctype} charger {cid}: vehicle connected and {action}.',
-                tags='electric_plug,white_check_mark'
+                title=f'\u26a1 {cid} - Vehicle Plugged In',
+                body=f'A vehicle has just plugged into {ctype} charger {cid}.\nConnector is preparing — charging will start shortly.\nTime: {time_str}',
+                tags='electric_plug,hourglass_flowing_sand',
+                priority='high'
             )
 
-        # ── Session complete ──────────────────────────────────────────────
+        # Charging actually started
+        elif status == 'Charging' and prev_status != 'Charging':
+            notify(
+                title=f'\u26a1 {cid} - Charging Started',
+                body=f'{ctype} charger {cid} is now actively charging.\nTime: {time_str}',
+                tags='electric_plug,white_check_mark',
+                priority='high'
+            )
+
         elif status in ('Finishing', 'Available') and prev_status in ('Charging', 'Finishing', 'Preparing'):
-            # Try live session one more time; fall back to last snapshot
             session = get_active_session(cid)
             kwh = extract_kwh(session) or prev.get('last_kwh')
             rev = extract_revenue(session) or prev.get('last_rev')
@@ -190,31 +189,28 @@ def check_once():
             if rev is not None: lines.append(f'Revenue earned:   Rs {rev}')
             if kwh is None and rev is None:
                 lines.append('(Session data not available from API)')
+            lines.append(f'Time: {time_str}')
 
             notify(
-                title=f'DONE {cid} - Charging complete',
+                title=f'\u2705 {cid} - Charging Complete',
                 body=chr(10).join(lines),
                 tags='battery,moneybag'
             )
 
-            # Add to daily totals
             if kwh: state['daily']['kwh']     = round(state['daily']['kwh'] + kwh, 2)
             if rev: state['daily']['revenue'] = round(state['daily']['revenue'] + rev, 2)
             state['daily']['sessions'] += 1
-
-            # Clear snapshot
             state[cid].pop('last_kwh', None)
             state[cid].pop('last_rev', None)
 
-        # ── Disconnected (not after charging) ────────────────────────────
         elif status == 'Available' and prev_status == 'Preparing':
             notify(
-                title=f'{cid} - Vehicle disconnected',
-                body=f'{ctype} charger {cid} is now free (unplugged without charging).',
+                title=f'{cid} - Vehicle Disconnected',
+                body=f'{ctype} charger {cid} is now free.\nVehicle unplugged before charging started.\nTime: {time_str}',
                 priority='default', tags='wave'
             )
 
-    # ── 9pm daily summary (Sri Lanka time) ───────────────────────────────────
+    # 9pm Sri Lanka daily summary
     if sl_hour() == 21 and not state['daily'].get('summary_sent'):
         d = state['daily']
         today_str = datetime.now(SL_TZ).strftime('%d %b %Y')
@@ -233,8 +229,6 @@ def check_once():
         state['daily']['summary_sent'] = True
 
     save_state(state)
-
-# ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
     if not login():
