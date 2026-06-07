@@ -1,0 +1,117 @@
+name: Profit Report (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Date to report (YYYY-MM-DD)'
+        required: true
+        default: '2026-06-07'
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests urllib3 --break-system-packages
+      - name: Send profit report
+        env:
+          RECHARGE_EMAIL: ${{ secrets.RECHARGE_EMAIL }}
+          RECHARGE_PASSWORD: ${{ secrets.RECHARGE_PASSWORD }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          REPORT_DATE: ${{ github.event.inputs.date }}
+        run: |
+          python3 - <<'EOF'
+          import os, requests, warnings
+          warnings.filterwarnings('ignore')
+
+          EMAIL = os.environ['RECHARGE_EMAIL']
+          PASSWORD = os.environ['RECHARGE_PASSWORD']
+          NTFY_TOPIC = os.environ['NTFY_TOPIC']
+          OWNER_ID = 27
+          REPORT_DATE = os.environ.get('REPORT_DATE', '2026-06-07')
+
+          API_BASES = ['https://recharge.lk/api', 'https://recharge.lk:8080/api', 'http://recharge.lk:8080/api']
+
+          token = None
+          base = None
+          for b in API_BASES:
+              for path in ['/auth/owner/login', '/owner/authenticate', '/authenticate']:
+                  try:
+                      r = requests.post(f'{b}{path}', json={'email': EMAIL, 'password': PASSWORD}, timeout=20, verify=False)
+                      if r.status_code == 200:
+                          result = r.json().get('result', {})
+                          t = result.get('token') if isinstance(result, dict) else None
+                          if t:
+                              token, base = t, b
+                              print(f'Login OK via {b}{path}')
+                              break
+                  except Exception as e:
+                      print(f'{b}{path}: {e}')
+              if token:
+                  break
+
+          if not token:
+              print('Login failed'); exit(1)
+
+          total_profit = 0.0
+          total_kwh = 0.0
+          total_sessions = 0
+          success = False
+
+          for b in ['https://recharge.lk:8080/api', 'http://recharge.lk:8080/api', base]:
+              try:
+                  r = requests.get(
+                      f'{b}/owner/getAllSessionHistory/{OWNER_ID}',
+                      params={'startDate': REPORT_DATE, 'endDate': REPORT_DATE},
+                      headers={'Authorization': f'Bearer {token}'},
+                      timeout=20, verify=False
+                  )
+                  if not r.ok:
+                      print(f'{b}: HTTP {r.status_code}')
+                      continue
+                  data = r.json()
+                  items = data.get('result', [])
+                  for station in items:
+                      for session in station.get('walletData', []):
+                          start = session.get('start', '')
+                          if start.startswith(REPORT_DATE):
+                              total_profit += float(session.get('profit', 0) or 0)
+                              total_kwh += float(session.get('usedKwh', 0) or 0)
+                              total_sessions += 1
+                      for session in station.get('packageData', []):
+                          start = session.get('start', '')
+                          if start.startswith(REPORT_DATE):
+                              total_profit += float(session.get('profit', 0) or 0)
+                              total_kwh += float(session.get('usedKwh', 0) or 0)
+                              total_sessions += 1
+                  success = True
+                  break
+              except Exception as e:
+                  print(f'{b}: {e}')
+
+          if not success:
+              requests.post(f'https://ntfy.sh/{NTFY_TOPIC}',
+                  data=f'Could not fetch data for {REPORT_DATE} — API unreachable.'.encode(),
+                  headers={'Title': f'Profit Report {REPORT_DATE}', 'Tags': 'x', 'Priority': 'default'}, timeout=15)
+              exit(1)
+
+          from datetime import datetime
+          try:
+              day_label = datetime.strptime(REPORT_DATE, '%Y-%m-%d').strftime('%d %b %Y')
+          except:
+              day_label = REPORT_DATE
+
+          body = f"Date: {day_label}\nSessions: {total_sessions}\nEnergy: {round(total_kwh,2)} kWh\nProfit: Rs. {round(total_profit,2)}"
+          print(body)
+
+          requests.post(f'https://ntfy.sh/{NTFY_TOPIC}',
+              data=body.encode('utf-8'),
+              headers={'Title': f'Profit Report — {day_label}', 'Tags': 'bar_chart,moneybag', 'Priority': 'default',
+                       'Content-Type': 'text/plain; charset=utf-8'},
+              timeout=15)
+          print('Notification sent.')
+          EOF
