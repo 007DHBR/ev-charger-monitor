@@ -1,0 +1,39 @@
+name: EV Charger Monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run charger monitor
+        env:
+          RECHARGE_EMAIL:    ${{ secrets.RECHARGE_EMAIL }}
+          RECHARGE_PASSWORD: ${{ secrets.RECHARGE_PASSWORD }}
+          NTFY_TOPIC:        ${{ secrets.NTFY_TOPIC }}
+        run: python monitor.py
+
+      - name: Save updated state
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "chore: update charger state"
+          git push
