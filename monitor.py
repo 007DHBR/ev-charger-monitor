@@ -7,12 +7,12 @@ PASSWORD   = os.environ['RECHARGE_PASSWORD']
 NTFY_TOPIC = os.environ['NTFY_TOPIC']
 
 STATION_ID    = 45
+OWNER_ID      = 27
 CHARGERS      = ['DC020', 'AC007']
 STATE_FILE    = 'state.json'
-POLL_INTERVAL = 30    # seconds between checks
-LOOP_DURATION = 270   # 4.5 min loop, then exit for next cron
+POLL_INTERVAL = 30
+LOOP_DURATION = 270
 
-# Sri Lanka is UTC+5:30
 SL_TZ = timezone(timedelta(hours=5, minutes=30))
 
 API_BASES = [
@@ -57,27 +57,60 @@ def get_active_session(cid):
             timeout=20, verify=False)
         if r.ok and r.text.strip():
             data = r.json()
-            if data and isinstance(data, dict):
-                return data
+            if data and isinstance(data, dict) and data.get('result'):
+                return data['result'] if isinstance(data.get('result'), dict) else data
     except: pass
     return None
 
 def extract_kwh(session):
     if not session or not isinstance(session, dict): return None
-    for key in ['totalEnergy', 'energyKwh', 'energy', 'meterValue', 'kwh']:
+    for key in ['totalEnergy', 'energyKwh', 'energy', 'meterValue', 'kwh', 'usedEnergy']:
         v = session.get(key)
         if v is not None:
             try: return round(float(v), 2)
             except: pass
     return None
 
-def extract_revenue(session):
+def extract_profit(session, kwh=None):
+    """Try to get profit directly, or calculate from revenue - CEB cost - commission."""
     if not session or not isinstance(session, dict): return None
-    for key in ['amount', 'revenue', 'totalAmount', 'cost', 'price']:
+
+    # 1. Try direct profit field
+    for key in ['profit', 'ownerProfit', 'netEarnings', 'netAmount', 'netProfit', 'ownerAmount']:
         v = session.get(key)
         if v is not None:
             try: return round(float(v), 2)
             except: pass
+
+    # 2. Calculate: profit = revenue - CEB cost - commission
+    revenue = None
+    for key in ['amount', 'revenue', 'totalAmount', 'cost', 'totalCost']:
+        v = session.get(key)
+        if v is not None:
+            try: revenue = round(float(v), 2); break
+            except: pass
+
+    ceb_cost = None
+    for key in ['cebCost', 'electricityCost', 'cebAmount', 'unitCost', 'cebTotal']:
+        v = session.get(key)
+        if v is not None:
+            try: ceb_cost = round(float(v), 2); break
+            except: pass
+
+    commission = None
+    for key in ['commission', 'platformFee', 'commissionAmount', 'fee']:
+        v = session.get(key)
+        if v is not None:
+            try: commission = round(float(v), 2); break
+            except: pass
+
+    if revenue is not None:
+        deductions = 0
+        if ceb_cost is not None: deductions += ceb_cost
+        if commission is not None: deductions += commission
+        if deductions > 0:
+            return round(revenue - deductions, 2)
+
     return None
 
 def notify(title, body, tags='electric_plug', priority='high'):
@@ -114,7 +147,7 @@ def ensure_daily(state):
         state['daily'] = {
             'date': today,
             'kwh': 0.0,
-            'revenue': 0.0,
+            'profit': 0.0,
             'sessions': 0,
             'summary_sent': False,
         }
@@ -144,14 +177,14 @@ def check_once():
         prev_status = prev.get('status', 'Unknown')
         print(f'[{cid}] {prev_status} -> {status}')
 
-        # While charging, keep refreshing session snapshot
         if status == 'Charging':
             session = get_active_session(cid)
             if session:
                 kwh = extract_kwh(session)
-                rev = extract_revenue(session)
+                profit = extract_profit(session, kwh)
                 if kwh is not None: prev['last_kwh'] = kwh
-                if rev is not None: prev['last_rev'] = rev
+                if profit is not None: prev['last_profit'] = profit
+                print(f'[{cid}] session snapshot: {kwh} kWh, profit Rs {profit}')
 
         state[cid] = {**prev, 'status': status, 'updated': now}
 
@@ -161,7 +194,6 @@ def check_once():
         ctype = 'DC Fast' if cid.startswith('DC') else 'AC'
         time_str = sl_now_str()
 
-        # Vehicle plugged in — connector is preparing
         if status == 'Preparing' and prev_status not in ('Charging',):
             notify(
                 title=f'\u26a1 {cid} - Vehicle Plugged In',
@@ -170,7 +202,6 @@ def check_once():
                 priority='high'
             )
 
-        # Charging actually started
         elif status == 'Charging' and prev_status != 'Charging':
             notify(
                 title=f'\u26a1 {cid} - Charging Started',
@@ -182,12 +213,12 @@ def check_once():
         elif status in ('Finishing', 'Available') and prev_status in ('Charging', 'Finishing', 'Preparing'):
             session = get_active_session(cid)
             kwh = extract_kwh(session) or prev.get('last_kwh')
-            rev = extract_revenue(session) or prev.get('last_rev')
+            profit = extract_profit(session, kwh) or prev.get('last_profit')
 
             lines = [f'{ctype} charger {cid}: charging session complete.']
-            if kwh is not None: lines.append(f'Energy delivered: {kwh} kWh')
-            if rev is not None: lines.append(f'Revenue earned:   Rs {rev}')
-            if kwh is None and rev is None:
+            if kwh is not None:    lines.append(f'Energy delivered: {kwh} kWh')
+            if profit is not None: lines.append(f'Profit earned:    Rs {profit}')
+            if kwh is None and profit is None:
                 lines.append('(Session data not available from API)')
             lines.append(f'Time: {time_str}')
 
@@ -197,11 +228,11 @@ def check_once():
                 tags='battery,moneybag'
             )
 
-            if kwh: state['daily']['kwh']     = round(state['daily']['kwh'] + kwh, 2)
-            if rev: state['daily']['revenue'] = round(state['daily']['revenue'] + rev, 2)
+            if kwh:    state['daily']['kwh']    = round(state['daily']['kwh'] + kwh, 2)
+            if profit: state['daily']['profit'] = round(state['daily']['profit'] + profit, 2)
             state['daily']['sessions'] += 1
             state[cid].pop('last_kwh', None)
-            state[cid].pop('last_rev', None)
+            state[cid].pop('last_profit', None)
 
         elif status == 'Available' and prev_status == 'Preparing':
             notify(
@@ -210,7 +241,6 @@ def check_once():
                 priority='default', tags='wave'
             )
 
-    # 9pm Sri Lanka daily summary
     if sl_hour() == 21 and not state['daily'].get('summary_sent'):
         d = state['daily']
         today_str = datetime.now(SL_TZ).strftime('%d %b %Y')
@@ -218,7 +248,7 @@ def check_once():
             f'Daily summary for {today_str}',
             f'Total sessions:  {d["sessions"]}',
             f'Total energy:    {d["kwh"]} kWh',
-            f'Total revenue:   Rs {d["revenue"]}',
+            f'Total profit:    Rs {d["profit"]}',
         ]
         notify(
             title=f'Daily Report - {today_str}',
