@@ -1,62 +1,57 @@
-import os, json, sys, requests, warnings
+import os, json, sys, time, requests, warnings
 from datetime import datetime, timezone
-warnings.filterwarnings('ignore')  # suppress SSL warnings
+warnings.filterwarnings('ignore')
 
-EMAIL       = os.environ['RECHARGE_EMAIL']
-PASSWORD    = os.environ['RECHARGE_PASSWORD']
-NTFY_TOPIC  = os.environ['NTFY_TOPIC']
+EMAIL      = os.environ['RECHARGE_EMAIL']
+PASSWORD   = os.environ['RECHARGE_PASSWORD']
+NTFY_TOPIC = os.environ['NTFY_TOPIC']
 
-STATION_ID = 45
-CHARGERS   = ['DC020', 'AC007']
-STATE_FILE = 'state.json'
+STATION_ID   = 45
+CHARGERS     = ['DC020', 'AC007']
+STATE_FILE   = 'state.json'
+POLL_INTERVAL = 30   # seconds between checks
+LOOP_DURATION = 270  # run for 4.5 min, then exit so next cron can take over
 
-# Try multiple base URLs - port 443 first, then 8080
 API_BASES = [
     'https://recharge.lk/api',
     'https://recharge.lk:8080/api',
     'http://recharge.lk:8080/api',
 ]
 
+_token = None
+_base  = None
+
 def login():
-    login_paths = ['/auth/owner/login', '/owner/authenticate', '/authenticate']
+    global _token, _base
     for base in API_BASES:
-        for path in login_paths:
+        for path in ['/auth/owner/login', '/owner/authenticate', '/authenticate']:
             try:
-                r = requests.post(
-                    f'{base}{path}',
+                r = requests.post(f'{base}{path}',
                     json={'email': EMAIL, 'password': PASSWORD},
-                    timeout=20,
-                    verify=False
-                )
+                    timeout=20, verify=False)
                 if r.status_code == 200:
                     data = r.json()
                     result = data.get('result', {})
                     token = result.get('token') if isinstance(result, dict) else None
                     if token:
                         print(f'[login] OK via {base}{path}')
-                        return token, base
+                        _token, _base = token, base
+                        return True
             except Exception as e:
-                print(f'[login] {base}{path} error: {e}')
-    return None, None
+                print(f'[login] {base}{path}: {e}')
+    return False
 
-def get_charger_status(base, token):
-    r = requests.get(
-        f'{base}/charger/getChargerStatus/{STATION_ID}',
-        headers={'Authorization': f'Bearer {token}'},
-        timeout=20, verify=False
-    )
-    if r.ok:
-        return r.json().get('result', [])
-    print(f'[status] HTTP {r.status_code}')
-    return []
+def get_charger_status():
+    r = requests.get(f'{_base}/charger/getChargerStatus/{STATION_ID}',
+        headers={'Authorization': f'Bearer {_token}'},
+        timeout=20, verify=False)
+    return r.json().get('result', []) if r.ok else []
 
-def get_active_session(base, cid, token):
+def get_active_session(cid):
     try:
-        r = requests.get(
-            f'{base}/oCcp/getChargerActiveSession?chargerId={cid}',
-            headers={'Authorization': f'Bearer {token}'},
-            timeout=20, verify=False
-        )
+        r = requests.get(f'{_base}/oCcp/getChargerActiveSession?chargerId={cid}',
+            headers={'Authorization': f'Bearer {_token}'},
+            timeout=20, verify=False)
         if r.ok and r.text.strip():
             return r.json()
     except: pass
@@ -64,17 +59,11 @@ def get_active_session(base, cid, token):
 
 def notify(title, body, tags='electric_plug', priority='high'):
     try:
-        r = requests.post(
-            f'https://ntfy.sh/{NTFY_TOPIC}',
+        r = requests.post(f'https://ntfy.sh/{NTFY_TOPIC}',
             data=body.encode('utf-8'),
-            headers={
-                'Title': title,
-                'Tags': tags,
-                'Priority': priority,
-                'Content-Type': 'text/plain; charset=utf-8',
-            },
-            timeout=15
-        )
+            headers={'Title': title, 'Tags': tags, 'Priority': priority,
+                     'Content-Type': 'text/plain; charset=utf-8'},
+            timeout=15)
         print(f'[notify] {title} -> HTTP {r.status_code}')
     except Exception as e:
         print(f'[notify] error: {e}')
@@ -87,16 +76,11 @@ def load_state():
 def save_state(state):
     with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
 
-def main():
-    token, base = login()
-    if not token:
-        print('[main] Login failed on all endpoints')
-        sys.exit(1)
-
-    chargers_raw = get_charger_status(base, token)
+def check_once():
+    chargers_raw = get_charger_status()
     if not chargers_raw:
-        print('[main] No charger data returned')
-        sys.exit(1)
+        print('[check] No charger data')
+        return
 
     prev = load_state()
     new_state = {}
@@ -104,9 +88,7 @@ def main():
 
     for cid in CHARGERS:
         info = next((c for c in chargers_raw if c['chargerId'] == cid), None)
-        if not info:
-            print(f'[main] {cid} not found')
-            continue
+        if not info: continue
 
         connectors = info.get('connectors', [])
         def has(s): return any(c['status'] == s for c in connectors)
@@ -115,15 +97,14 @@ def main():
         elif has('Finishing'): status = 'Finishing'
         else: status = 'Available'
 
-        session = get_active_session(base, cid, token)
         new_state[cid] = {'status': status, 'updated': now}
-
         prev_status = prev.get(cid, {}).get('status', 'Unknown')
-        print(f'[{cid}] prev={prev_status}  curr={status}')
+        print(f'[{cid}] {prev_status} -> {status}')
 
         if prev_status == 'Unknown' or prev_status == status:
             continue
 
+        session = get_active_session(cid)
         ctype = 'DC Fast' if cid.startswith('DC') else 'AC'
 
         if status in ('Preparing', 'Charging'):
@@ -139,19 +120,45 @@ def main():
                 rev = session.get('amount') or session.get('revenue') or session.get('totalAmount')
                 if kwh: lines.append(f'Energy: {kwh} kWh')
                 if rev: lines.append(f'Revenue: Rs {rev}')
-            notify(
-                title=f'DONE {cid} - Charging complete',
-                body=chr(10).join(lines),
-                tags='battery,moneybag'
-            )
+            notify(title=f'DONE {cid} - Charging complete',
+                   body=chr(10).join(lines), tags='battery,moneybag')
         elif status == 'Available':
-            notify(
-                title=f'{cid} - Vehicle disconnected',
-                body=f'{ctype} charger {cid} is now free.',
-                priority='default'
-            )
+            notify(title=f'{cid} - Vehicle disconnected',
+                   body=f'{ctype} charger {cid} is now free.', priority='default')
 
     save_state(new_state)
+
+def main():
+    if not login():
+        print('[main] Login failed on all endpoints')
+        sys.exit(1)
+
+    start = time.time()
+    iteration = 0
+
+    while True:
+        iteration += 1
+        elapsed = time.time() - start
+        print(f'--- Check #{iteration} (elapsed {int(elapsed)}s) ---')
+
+        try:
+            check_once()
+        except Exception as e:
+            print(f'[check] Error: {e}')
+            # Re-login on error
+            if not login():
+                print('[main] Re-login failed, stopping')
+                break
+
+        elapsed = time.time() - start
+        if elapsed >= LOOP_DURATION:
+            print(f'[main] Loop duration reached ({int(elapsed)}s), exiting')
+            break
+
+        sleep_time = POLL_INTERVAL - (time.time() - start - (iteration - 1) * POLL_INTERVAL)
+        if sleep_time > 0:
+            print(f'[main] Sleeping {int(sleep_time)}s...')
+            time.sleep(sleep_time)
 
 if __name__ == '__main__':
     main()
