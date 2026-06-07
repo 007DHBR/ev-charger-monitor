@@ -2,21 +2,24 @@ import os, json, sys, time, requests, warnings
 from datetime import datetime, timezone, timedelta
 warnings.filterwarnings('ignore')
 
-EMAIL      = os.environ['RECHARGE_EMAIL']
-PASSWORD   = os.environ['RECHARGE_PASSWORD']
+EMAIL = os.environ['RECHARGE_EMAIL']
+PASSWORD = os.environ['RECHARGE_PASSWORD']
 NTFY_TOPIC = os.environ['NTFY_TOPIC']
 
-STATION_ID    = 45
-OWNER_ID      = 27
-CHARGERS      = ['DC020', 'AC007']
-STATE_FILE    = 'state.json'
+STATION_ID = 45
+OWNER_ID = 27
+CHARGERS = ['DC020', 'AC007']
+STATE_FILE = 'state.json'
 POLL_INTERVAL = 30
 LOOP_DURATION = 270
 
 SL_TZ = timezone(timedelta(hours=5, minutes=30))
 
 # If a charging session ends in less than this many seconds, it's a BMS/fault error
-BMS_ERROR_THRESHOLD_SECONDS = 60   # 1 minute
+BMS_ERROR_THRESHOLD_SECONDS = 60  # 1 minute
+
+# If a charger stays in Preparing for more than this many seconds, send stuck alert
+STUCK_PREPARING_THRESHOLD_SECONDS = 300  # 5 minutes
 
 API_BASES = [
     'https://recharge.lk/api',
@@ -25,7 +28,7 @@ API_BASES = [
 ]
 
 _token = None
-_base  = None
+_base = None
 
 def login():
     global _token, _base
@@ -148,6 +151,21 @@ def ensure_daily(state):
             'sessions': 0,
             'summary_sent': False,
             'heartbeat_sent': False,
+            'target_5000_sent': False,
+            'target_10000_sent': False,
+        }
+    return state
+
+def ensure_weekly(state):
+    now = datetime.now(SL_TZ)
+    monday = (now - timedelta(days=now.weekday())).strftime('%Y-%m-%d')
+    if state.get('weekly', {}).get('week_start') != monday:
+        state['weekly'] = {
+            'week_start': monday,
+            'kwh': 0.0,
+            'profit': 0.0,
+            'sessions': 0,
+            'summary_sent': False,
         }
     return state
 
@@ -158,6 +176,7 @@ def check_once():
 
     state = load_state()
     state = ensure_daily(state)
+    state = ensure_weekly(state)
     now_ts = utc_now_ts()
     now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -190,10 +209,10 @@ def check_once():
 
         connectors = info.get('connectors', [])
         def has(s): return any(c['status'] == s for c in connectors)
-        if has('Charging'):       status = 'Charging'
+        if has('Charging'): status = 'Charging'
         elif has('Preparing') or has('SuspendedEV') or has('SuspendedEVSE'): status = 'Preparing'
-        elif has('Finishing'):    status = 'Finishing'
-        else:                     status = 'Available'
+        elif has('Finishing'): status = 'Finishing'
+        else: status = 'Available'
 
         prev = state.get(cid, {})
         prev_status = prev.get('status', 'Unknown')
@@ -213,6 +232,27 @@ def check_once():
 
         state[cid] = {**prev, 'status': status, 'updated': now_iso}
 
+        # Track when charger first entered Preparing (for stuck alert)
+        if status == 'Preparing' and not state[cid].get('preparing_since'):
+            state[cid]['preparing_since'] = now_ts
+        # Clear preparing tracking when leaving Preparing
+        if status != 'Preparing':
+            state[cid].pop('preparing_since', None)
+            state[cid].pop('preparing_alert_sent', None)
+        # Stuck-in-Preparing check (runs every poll)
+        if status == 'Preparing':
+            p_since = state[cid].get('preparing_since')
+            if p_since and not state[cid].get('preparing_alert_sent'):
+                if (now_ts - p_since) >= STUCK_PREPARING_THRESHOLD_SECONDS:
+                    ctype = 'DC Fast' if cid.startswith('DC') else 'AC'
+                    notify(
+                        title=f'\u26a0\ufe0f {cid} - Not Charging',
+                        body=f'{ctype} charger {cid} still did not charge after 5 minutes of being plugged in.',
+                        tags='warning,hourglass',
+                        priority='high'
+                    )
+                    state[cid]['preparing_alert_sent'] = True
+
         if prev_status == 'Unknown' or prev_status == status:
             continue
 
@@ -222,7 +262,7 @@ def check_once():
         if status == 'Preparing' and prev_status not in ('Charging',):
             notify(
                 title=f'\u26a1 {cid} - Vehicle Plugged In',
-                body=f'A vehicle has just plugged into {ctype} charger {cid}.\nConnector is preparing — charging will start shortly.\nTime: {time_str}',
+                body=f'A vehicle has just plugged into {ctype} charger {cid}.\nConnector is preparing \u2014 charging will start shortly.\nTime: {time_str}',
                 tags='electric_plug,hourglass_flowing_sand',
                 priority='high'
             )
@@ -240,18 +280,16 @@ def check_once():
             session_duration = (now_ts - charge_start_ts) if charge_start_ts else None
 
             session = get_active_session(cid)
-            kwh    = extract_kwh(session)    or prev.get('last_kwh')
+            kwh = extract_kwh(session) or prev.get('last_kwh')
             profit = extract_profit(session) or prev.get('last_profit')
 
-            # BMS/fault: session ended under threshold regardless of kWh — even 0.0 kWh counts
+            # BMS/fault: session ended under threshold regardless of kWh
             is_bms_error = (
                 session_duration is not None and
                 session_duration < BMS_ERROR_THRESHOLD_SECONDS
             )
 
             if is_bms_error:
-                duration_str = f'{int(session_duration)}s' if session_duration else 'unknown'
-                kwh_str = f'{kwh} kWh' if kwh else '0 kWh'
                 notify(
                     title=f'\u26a0\ufe0f {cid} - BMS ERROR',
                     body=f'{ctype} charger {cid} stopped. BMS error detected.',
@@ -260,8 +298,8 @@ def check_once():
                 )
             else:
                 lines = [f'{ctype} charger {cid}: charging session complete.']
-                if kwh is not None:    lines.append(f'Energy delivered: {kwh} kWh')
-                if profit is not None: lines.append(f'Profit earned:    Rs {profit}')
+                if kwh is not None: lines.append(f'Energy delivered: {kwh} kWh')
+                if profit is not None: lines.append(f'Profit earned: Rs {profit}')
                 if kwh is None and profit is None:
                     lines.append('(Session data not available from API)')
                 lines.append(f'Time: {time_str}')
@@ -272,9 +310,33 @@ def check_once():
                     tags='battery,moneybag'
                 )
 
-                if kwh:    state['daily']['kwh']    = round(state['daily']['kwh'] + kwh, 2)
-                if profit: state['daily']['profit'] = round(state['daily']['profit'] + profit, 2)
-                state['daily']['sessions'] += 1
+            if kwh: state['daily']['kwh'] = round(state['daily']['kwh'] + kwh, 2)
+            if profit: state['daily']['profit'] = round(state['daily']['profit'] + profit, 2)
+            state['daily']['sessions'] += 1
+
+            # Update weekly stats
+            if kwh: state['weekly']['kwh'] = round(state['weekly'].get('kwh', 0) + kwh, 2)
+            if profit: state['weekly']['profit'] = round(state['weekly'].get('profit', 0) + profit, 2)
+            state['weekly']['sessions'] = state['weekly'].get('sessions', 0) + 1
+
+            # Daily profit targets
+            daily_profit = state['daily']['profit']
+            if not state['daily'].get('target_5000_sent') and daily_profit >= 5000:
+                notify(
+                    title='\U0001f3af Daily Target \u2014 Rs. 5,000!',
+                    body=f"Today's profit has reached Rs. 5,000! Keep it up.\nTotal so far: Rs. {daily_profit}",
+                    tags='dart,moneybag',
+                    priority='high'
+                )
+                state['daily']['target_5000_sent'] = True
+            if not state['daily'].get('target_10000_sent') and daily_profit >= 10000:
+                notify(
+                    title='\U0001f525 Daily Target \u2014 Rs. 10,000!',
+                    body=f"Incredible! Daily profit has reached Rs. 10,000!\nTotal today: Rs. {daily_profit}",
+                    tags='fire,moneybag',
+                    priority='urgent'
+                )
+                state['daily']['target_10000_sent'] = True
 
             state[cid].pop('last_kwh', None)
             state[cid].pop('last_profit', None)
@@ -297,14 +359,26 @@ def check_once():
         )
         state['daily']['heartbeat_sent'] = True
 
+    # Weekly summary: Monday at 9am SL time
+    if datetime.now(SL_TZ).weekday() == 0 and sl_hour() == 9 and not state['weekly'].get('summary_sent'):
+        w = state['weekly']
+        week_start = w.get('week_start', 'this week')
+        notify(
+            title='\U0001f4ca Weekly Summary',
+            body=f"Week of {week_start}\nSessions: {w['sessions']}\nEnergy: {w['kwh']} kWh\nProfit: Rs. {w['profit']}",
+            tags='bar_chart,moneybag',
+            priority='default'
+        )
+        state['weekly']['summary_sent'] = True
+
     if sl_hour() == 21 and not state['daily'].get('summary_sent'):
         d = state['daily']
         today_str = datetime.now(SL_TZ).strftime('%d %b %Y')
         lines = [
             f'Daily summary for {today_str}',
-            f'Total sessions:  {d["sessions"]}',
-            f'Total energy:    {d["kwh"]} kWh',
-            f'Total profit:    Rs {d["profit"]}',
+            f'Total sessions: {d["sessions"]}',
+            f'Total energy: {d["kwh"]} kWh',
+            f'Total profit: Rs {d["profit"]}',
         ]
         notify(
             title=f'Daily Report - {today_str}',
