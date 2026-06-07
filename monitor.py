@@ -229,14 +229,8 @@ def check_once():
                 duration_str = f'{int(session_duration)}s' if session_duration else 'unknown'
                 kwh_str = f'{kwh} kWh' if kwh else '0 kWh'
                 notify(
-                    title=f'\u26a0\ufe0f {cid} - BMS ERROR / Fault Detected',
-                    body=(
-                        f'WARNING: {ctype} charger {cid} stopped unexpectedly!\n'
-                        f'Session lasted only {duration_str} — {kwh_str} delivered.\n'
-                        f'Possible cause: Vehicle BMS error, connector fault, or charger issue.\n'
-                        f'Action needed: Check the charger screen.\n'
-                        f'Time: {time_str}'
-                    ),
+                    title=f'\u26a0\ufe0f {cid} - BMS ERROR',
+                    body=f'{ctype} charger {cid} stopped. BMS error detected.',
                     tags='warning,rotating_light',
                     priority='urgent'
                 )
