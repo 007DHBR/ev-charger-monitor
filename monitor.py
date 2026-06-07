@@ -16,7 +16,7 @@ LOOP_DURATION = 270
 SL_TZ = timezone(timedelta(hours=5, minutes=30))
 
 # If a charging session ends in less than this many seconds, it's a BMS/fault error
-BMS_ERROR_THRESHOLD_SECONDS = 180  # 3 minutes
+BMS_ERROR_THRESHOLD_SECONDS = 60   # 1 minute
 
 API_BASES = [
     'https://recharge.lk/api',
