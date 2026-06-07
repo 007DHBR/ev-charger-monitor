@@ -15,6 +15,9 @@ LOOP_DURATION = 270
 
 SL_TZ = timezone(timedelta(hours=5, minutes=30))
 
+# If a charging session ends in less than this many seconds, it's a BMS/fault error
+BMS_ERROR_THRESHOLD_SECONDS = 180  # 3 minutes
+
 API_BASES = [
     'https://recharge.lk/api',
     'https://recharge.lk:8080/api',
@@ -72,45 +75,36 @@ def extract_kwh(session):
     return None
 
 def extract_profit(session, kwh=None):
-    """Try to get profit directly, or calculate from revenue - CEB cost - commission."""
     if not session or not isinstance(session, dict): return None
-
-    # 1. Try direct profit field
     for key in ['profit', 'ownerProfit', 'netEarnings', 'netAmount', 'netProfit', 'ownerAmount']:
         v = session.get(key)
         if v is not None:
             try: return round(float(v), 2)
             except: pass
-
-    # 2. Calculate: profit = revenue - CEB cost - commission
     revenue = None
     for key in ['amount', 'revenue', 'totalAmount', 'cost', 'totalCost']:
         v = session.get(key)
         if v is not None:
             try: revenue = round(float(v), 2); break
             except: pass
-
     ceb_cost = None
     for key in ['cebCost', 'electricityCost', 'cebAmount', 'unitCost', 'cebTotal']:
         v = session.get(key)
         if v is not None:
             try: ceb_cost = round(float(v), 2); break
             except: pass
-
     commission = None
     for key in ['commission', 'platformFee', 'commissionAmount', 'fee']:
         v = session.get(key)
         if v is not None:
             try: commission = round(float(v), 2); break
             except: pass
-
     if revenue is not None:
         deductions = 0
         if ceb_cost is not None: deductions += ceb_cost
         if commission is not None: deductions += commission
         if deductions > 0:
             return round(revenue - deductions, 2)
-
     return None
 
 def notify(title, body, tags='electric_plug', priority='high'):
@@ -141,6 +135,9 @@ def sl_today():
 def sl_hour():
     return datetime.now(SL_TZ).hour
 
+def utc_now_ts():
+    return datetime.now(timezone.utc).timestamp()
+
 def ensure_daily(state):
     today = sl_today()
     if state.get('daily', {}).get('date') != today:
@@ -160,7 +157,8 @@ def check_once():
 
     state = load_state()
     state = ensure_daily(state)
-    now = datetime.now(timezone.utc).isoformat()
+    now_ts = utc_now_ts()
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     for cid in CHARGERS:
         info = next((c for c in chargers_raw if c['chargerId'] == cid), None)
@@ -177,6 +175,12 @@ def check_once():
         prev_status = prev.get('status', 'Unknown')
         print(f'[{cid}] {prev_status} -> {status}')
 
+        # Track when charging actually started
+        if status == 'Charging' and prev_status != 'Charging':
+            prev['charge_start_ts'] = now_ts
+            print(f'[{cid}] charge_start_ts recorded')
+
+        # While charging, snapshot session data
         if status == 'Charging':
             session = get_active_session(cid)
             if session:
@@ -184,9 +188,8 @@ def check_once():
                 profit = extract_profit(session, kwh)
                 if kwh is not None: prev['last_kwh'] = kwh
                 if profit is not None: prev['last_profit'] = profit
-                print(f'[{cid}] session snapshot: {kwh} kWh, profit Rs {profit}')
 
-        state[cid] = {**prev, 'status': status, 'updated': now}
+        state[cid] = {**prev, 'status': status, 'updated': now_iso}
 
         if prev_status == 'Unknown' or prev_status == status:
             continue
@@ -194,6 +197,7 @@ def check_once():
         ctype = 'DC Fast' if cid.startswith('DC') else 'AC'
         time_str = sl_now_str()
 
+        # Vehicle plugged in
         if status == 'Preparing' and prev_status not in ('Charging',):
             notify(
                 title=f'\u26a1 {cid} - Vehicle Plugged In',
@@ -202,6 +206,7 @@ def check_once():
                 priority='high'
             )
 
+        # Charging started
         elif status == 'Charging' and prev_status != 'Charging':
             notify(
                 title=f'\u26a1 {cid} - Charging Started',
@@ -210,29 +215,58 @@ def check_once():
                 priority='high'
             )
 
+        # Session ended — check if it was suspiciously short (BMS error)
         elif status in ('Finishing', 'Available') and prev_status in ('Charging', 'Finishing', 'Preparing'):
+            charge_start_ts = prev.get('charge_start_ts')
+            session_duration = (now_ts - charge_start_ts) if charge_start_ts else None
+
             session = get_active_session(cid)
-            kwh = extract_kwh(session) or prev.get('last_kwh')
-            profit = extract_profit(session, kwh) or prev.get('last_profit')
+            kwh    = extract_kwh(session)    or prev.get('last_kwh')
+            profit = extract_profit(session) or prev.get('last_profit')
 
-            lines = [f'{ctype} charger {cid}: charging session complete.']
-            if kwh is not None:    lines.append(f'Energy delivered: {kwh} kWh')
-            if profit is not None: lines.append(f'Profit earned:    Rs {profit}')
-            if kwh is None and profit is None:
-                lines.append('(Session data not available from API)')
-            lines.append(f'Time: {time_str}')
-
-            notify(
-                title=f'\u2705 {cid} - Charging Complete',
-                body=chr(10).join(lines),
-                tags='battery,moneybag'
+            # BMS / fault: charged for less than threshold and barely any kWh
+            is_bms_error = (
+                session_duration is not None and
+                session_duration < BMS_ERROR_THRESHOLD_SECONDS and
+                (kwh is None or kwh < 0.5)
             )
 
-            if kwh:    state['daily']['kwh']    = round(state['daily']['kwh'] + kwh, 2)
-            if profit: state['daily']['profit'] = round(state['daily']['profit'] + profit, 2)
-            state['daily']['sessions'] += 1
+            if is_bms_error:
+                duration_str = f'{int(session_duration)}s' if session_duration else 'unknown'
+                notify(
+                    title=f'\u26a0\ufe0f {cid} - BMS ERROR / Fault Detected',
+                    body=(
+                        f'WARNING: {ctype} charger {cid} stopped unexpectedly!\n'
+                        f'Session ended only {duration_str} after charging started.\n'
+                        f'Possible cause: Vehicle BMS error, connector fault, or charger issue.\n'
+                        f'Action needed: Check the charger screen.\n'
+                        f'Time: {time_str}'
+                    ),
+                    tags='warning,rotating_light',
+                    priority='urgent'
+                )
+            else:
+                lines = [f'{ctype} charger {cid}: charging session complete.']
+                if kwh is not None:    lines.append(f'Energy delivered: {kwh} kWh')
+                if profit is not None: lines.append(f'Profit earned:    Rs {profit}')
+                if kwh is None and profit is None:
+                    lines.append('(Session data not available from API)')
+                lines.append(f'Time: {time_str}')
+
+                notify(
+                    title=f'\u2705 {cid} - Charging Complete',
+                    body=chr(10).join(lines),
+                    tags='battery,moneybag'
+                )
+
+                if kwh:    state['daily']['kwh']    = round(state['daily']['kwh'] + kwh, 2)
+                if profit: state['daily']['profit'] = round(state['daily']['profit'] + profit, 2)
+                state['daily']['sessions'] += 1
+
+            # Clean up session tracking
             state[cid].pop('last_kwh', None)
             state[cid].pop('last_profit', None)
+            state[cid].pop('charge_start_ts', None)
 
         elif status == 'Available' and prev_status == 'Preparing':
             notify(
@@ -241,6 +275,7 @@ def check_once():
                 priority='default', tags='wave'
             )
 
+    # 9pm Sri Lanka daily summary
     if sl_hour() == 21 and not state['daily'].get('summary_sent'):
         d = state['daily']
         today_str = datetime.now(SL_TZ).strftime('%d %b %Y')
