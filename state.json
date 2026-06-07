@@ -1,10 +1,17 @@
 {
   "DC020": {
     "status": "Available",
-    "updated": "2026-06-07T16:04:27.442383+00:00"
+    "updated": "2026-06-07T17:12:22.462964+00:00"
   },
   "AC007": {
     "status": "Available",
-    "updated": "2026-06-07T16:04:27.442383+00:00"
+    "updated": "2026-06-07T17:12:22.462964+00:00"
+  },
+  "daily": {
+    "date": "2026-06-07",
+    "kwh": 0.0,
+    "profit": 0.0,
+    "sessions": 0,
+    "summary_sent": false
   }
 }
