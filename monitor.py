@@ -147,6 +147,7 @@ def ensure_daily(state):
             'profit': 0.0,
             'sessions': 0,
             'summary_sent': False,
+            'heartbeat_sent': False,
         }
     return state
 
@@ -162,7 +163,30 @@ def check_once():
 
     for cid in CHARGERS:
         info = next((c for c in chargers_raw if c['chargerId'] == cid), None)
-        if not info: continue
+        if not info:
+            prev = state.get(cid, {})
+            miss_count = prev.get('missing_count', 0) + 1
+            state[cid] = {**prev, 'missing_count': miss_count}
+            if miss_count == 2:
+                ctype = 'DC Fast' if cid.startswith('DC') else 'AC'
+                notify(
+                    title=f'\u26ab {cid} - Charger Offline',
+                    body=f'{ctype} charger {cid} is not responding. May have lost power or internet.',
+                    tags='warning,no_entry',
+                    priority='high'
+                )
+            save_state(state)
+            continue
+        prev_missing = state.get(cid, {}).get('missing_count', 0)
+        if prev_missing >= 2:
+            ctype = 'DC Fast' if cid.startswith('DC') else 'AC'
+            notify(
+                title=f'\u2705 {cid} - Charger Back Online',
+                body=f'{ctype} charger {cid} is back online.',
+                tags='white_check_mark',
+                priority='default'
+            )
+        if cid in state: state[cid]['missing_count'] = 0
 
         connectors = info.get('connectors', [])
         def has(s): return any(c['status'] == s for c in connectors)
@@ -262,6 +286,16 @@ def check_once():
                 body=f'{ctype} charger {cid} is now free.\nVehicle unplugged before charging started.\nTime: {time_str}',
                 priority='default', tags='wave'
             )
+
+    # 8am heartbeat
+    if sl_hour() == 8 and not state['daily'].get('heartbeat_sent'):
+        notify(
+            title='\u2705 Monitor Running',
+            body='EV charger monitor is active. Both chargers are being watched.',
+            tags='white_check_mark',
+            priority='default'
+        )
+        state['daily']['heartbeat_sent'] = True
 
     if sl_hour() == 21 and not state['daily'].get('summary_sent'):
         d = state['daily']
