@@ -15,11 +15,8 @@ LOOP_DURATION = 270
 
 SL_TZ = timezone(timedelta(hours=5, minutes=30))
 
-# If a charging session ends in less than this many seconds, it's a BMS/fault error
-BMS_ERROR_THRESHOLD_SECONDS = 60  # 1 minute
-
-# If a charger stays in Preparing for more than this many seconds, send stuck alert
-STUCK_PREPARING_THRESHOLD_SECONDS = 300  # 5 minutes
+BMS_ERROR_THRESHOLD_SECONDS = 60
+STUCK_PREPARING_THRESHOLD_SECONDS = 300
 
 API_BASES = [
     'https://recharge.lk/api',
@@ -68,6 +65,51 @@ def get_active_session(cid):
     except: pass
     return None
 
+def get_today_profit():
+    """
+    Fetch today's real profit/kWh/sessions from the session history API.
+    Uses each session's actual price/CEB/commission rates (handles special rates per person).
+    Returns (profit, kwh, sessions) or None if the API is unreachable.
+    """
+    today = sl_today()
+    bases = ['https://recharge.lk:8080/api', 'http://recharge.lk:8080/api', _base]
+    for base in bases:
+        try:
+            r = requests.get(
+                f'{base}/owner/getAllSessionHistory/{OWNER_ID}',
+                params={'startDate': today, 'endDate': today},
+                headers={'Authorization': f'Bearer {_token}'},
+                timeout=20, verify=False
+            )
+            if not r.ok:
+                continue
+            data = r.json()
+            items = data.get('result', [])
+            if not items:
+                return (0.0, 0.0, 0)
+            total_profit = 0.0
+            total_kwh = 0.0
+            total_sessions = 0
+            for station in items:
+                for session in station.get('walletData', []):
+                    start = session.get('start', '')
+                    if start.startswith(today):
+                        total_profit += float(session.get('profit', 0) or 0)
+                        total_kwh += float(session.get('usedKwh', 0) or 0)
+                        total_sessions += 1
+                for session in station.get('packageData', []):
+                    start = session.get('start', '')
+                    if start.startswith(today):
+                        total_profit += float(session.get('profit', 0) or 0)
+                        total_kwh += float(session.get('usedKwh', 0) or 0)
+                        total_sessions += 1
+            print(f'[profit] Today: {total_sessions} sessions, {round(total_kwh,2)} kWh, Rs {round(total_profit,2)}')
+            return (round(total_profit, 2), round(total_kwh, 3), total_sessions)
+        except Exception as e:
+            print(f'[profit] {base}: {e}')
+    print('[profit] All bases failed \u2014 using accumulated state')
+    return None
+
 def extract_kwh(session):
     if not session or not isinstance(session, dict): return None
     for key in ['totalEnergy', 'energyKwh', 'energy', 'meterValue', 'kwh', 'usedEnergy']:
@@ -91,7 +133,7 @@ def extract_profit(session, kwh=None):
             try: revenue = round(float(v), 2); break
             except: pass
     ceb_cost = None
-    for key in ['cebCost', 'electricityCost', 'cebAmount', 'unitCost', 'cebTotal']:
+    for key in ['cebCost', 'electricityCost', 'cebAmount', 'unitCost', 'cebTotal']: 
         v = session.get(key)
         if v is not None:
             try: ceb_cost = round(float(v), 2); break
@@ -184,8 +226,7 @@ def check_once():
         info = next((c for c in chargers_raw if c['chargerId'] == cid), None)
         if not info:
             prev = state.get(cid, {})
-            miss_count = prev.get('missing_count', 0) + 1
-            state[cid] = {**prev, 'missing_count': miss_count}
+feat: accurate daily profit from session history API (per-person rates)            state[cid] = {**prev, 'missing_count': miss_count}
             if miss_count == 2:
                 ctype = 'DC Fast' if cid.startswith('DC') else 'AC'
                 notify(
@@ -232,14 +273,11 @@ def check_once():
 
         state[cid] = {**prev, 'status': status, 'updated': now_iso}
 
-        # Track when charger first entered Preparing (for stuck alert)
         if status == 'Preparing' and not state[cid].get('preparing_since'):
             state[cid]['preparing_since'] = now_ts
-        # Clear preparing tracking when leaving Preparing
         if status != 'Preparing':
             state[cid].pop('preparing_since', None)
             state[cid].pop('preparing_alert_sent', None)
-        # Stuck-in-Preparing check (runs every poll)
         if status == 'Preparing':
             p_since = state[cid].get('preparing_since')
             if p_since and not state[cid].get('preparing_alert_sent'):
@@ -283,7 +321,6 @@ def check_once():
             kwh = extract_kwh(session) or prev.get('last_kwh')
             profit = extract_profit(session) or prev.get('last_profit')
 
-            # BMS/fault: session ended under threshold regardless of kWh
             is_bms_error = (
                 session_duration is not None and
                 session_duration < BMS_ERROR_THRESHOLD_SECONDS
@@ -303,40 +340,11 @@ def check_once():
                 if kwh is None and profit is None:
                     lines.append('(Session data not available from API)')
                 lines.append(f'Time: {time_str}')
-
                 notify(
                     title=f'\u2705 {cid} - Charging Complete',
                     body=chr(10).join(lines),
                     tags='battery,moneybag'
                 )
-
-            if kwh: state['daily']['kwh'] = round(state['daily']['kwh'] + kwh, 2)
-            if profit: state['daily']['profit'] = round(state['daily']['profit'] + profit, 2)
-            state['daily']['sessions'] += 1
-
-            # Update weekly stats
-            if kwh: state['weekly']['kwh'] = round(state['weekly'].get('kwh', 0) + kwh, 2)
-            if profit: state['weekly']['profit'] = round(state['weekly'].get('profit', 0) + profit, 2)
-            state['weekly']['sessions'] = state['weekly'].get('sessions', 0) + 1
-
-            # Daily profit targets
-            daily_profit = state['daily']['profit']
-            if not state['daily'].get('target_5000_sent') and daily_profit >= 5000:
-                notify(
-                    title='\U0001f3af Daily Target \u2014 Rs. 5,000!',
-                    body=f"Today's profit has reached Rs. 5,000! Keep it up.\nTotal so far: Rs. {daily_profit}",
-                    tags='dart,moneybag',
-                    priority='high'
-                )
-                state['daily']['target_5000_sent'] = True
-            if not state['daily'].get('target_10000_sent') and daily_profit >= 10000:
-                notify(
-                    title='\U0001f525 Daily Target \u2014 Rs. 10,000!',
-                    body=f"Incredible! Daily profit has reached Rs. 10,000!\nTotal today: Rs. {daily_profit}",
-                    tags='fire,moneybag',
-                    priority='urgent'
-                )
-                state['daily']['target_10000_sent'] = True
 
             state[cid].pop('last_kwh', None)
             state[cid].pop('last_profit', None)
@@ -348,6 +356,37 @@ def check_once():
                 body=f'{ctype} charger {cid} is now free.\nVehicle unplugged before charging started.\nTime: {time_str}',
                 priority='default', tags='wave'
             )
+
+    # --- Update daily totals from real session history API ---
+    profit_data = get_today_profit()
+    if profit_data is not None:
+        real_profit, real_kwh, real_sessions = profit_data
+        prev_profit = state['daily']['profit']
+        state['daily']['profit'] = real_profit
+        state['daily']['kwh'] = real_kwh
+        state['daily']['sessions'] = real_sessions
+        delta = round(real_profit - prev_profit, 2)
+        if delta > 0:
+            state['weekly']['profit'] = round(state['weekly'].get('profit', 0) + delta, 2)
+
+    # Daily profit targets (checked every poll using real data)
+    daily_profit = state['daily']['profit']
+    if not state['daily'].get('target_5000_sent') and daily_profit >= 5000:
+        notify(
+            title='\U0001f3af Daily Target \u2014 Rs. 5,000!',
+            body=f"Today's profit has reached Rs. 5,000! Keep it up.\nTotal so far: Rs. {daily_profit}",
+            tags='dart,moneybag',
+            priority='high'
+        )
+        state['daily']['target_5000_sent'] = True
+    if not state['daily'].get('target_10000_sent') and daily_profit >= 10000:
+        notify(
+            title='\U0001f525 Daily Target \u2014 Rs. 10,000!',
+            body=f"Incredible! Daily profit has reached Rs. 10,000!\nTotal today: Rs. {daily_profit}",
+            tags='fire,moneybag',
+            priority='urgent'
+        )
+        state['daily']['target_10000_sent'] = True
 
     # 8am heartbeat
     if sl_hour() == 8 and not state['daily'].get('heartbeat_sent'):
@@ -371,18 +410,13 @@ def check_once():
         )
         state['weekly']['summary_sent'] = True
 
+    # 9pm daily summary
     if sl_hour() == 21 and not state['daily'].get('summary_sent'):
         d = state['daily']
         today_str = datetime.now(SL_TZ).strftime('%d %b %Y')
-        lines = [
-            f'Daily summary for {today_str}',
-            f'Total sessions: {d["sessions"]}',
-            f'Total energy: {d["kwh"]} kWh',
-            f'Total profit: Rs {d["profit"]}',
-        ]
         notify(
             title=f'Daily Report - {today_str}',
-            body=chr(10).join(lines),
+            body=f"Daily summary for {today_str}\nTotal sessions: {d['sessions']}\nTotal energy: {d['kwh']} kWh\nTotal profit: Rs {d['profit']}",
             tags='bar_chart,moneybag',
             priority='default'
         )
