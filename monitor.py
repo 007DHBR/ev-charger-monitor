@@ -66,11 +66,6 @@ def get_active_session(cid):
     return None
 
 def get_today_profit():
-    """
-    Fetch today's real profit/kWh/sessions from the session history API.
-    Uses each session's actual price/CEB/commission rates (handles special rates per person).
-    Returns (profit, kwh, sessions) or None if the API is unreachable.
-    """
     today = sl_today()
     bases = ['https://recharge.lk:8080/api', 'http://recharge.lk:8080/api', _base]
     for base in bases:
@@ -133,7 +128,7 @@ def extract_profit(session, kwh=None):
             try: revenue = round(float(v), 2); break
             except: pass
     ceb_cost = None
-    for key in ['cebCost', 'electricityCost', 'cebAmount', 'unitCost', 'cebTotal']: 
+    for key in ['cebCost', 'electricityCost', 'cebAmount', 'unitCost', 'cebTotal']:
         v = session.get(key)
         if v is not None:
             try: ceb_cost = round(float(v), 2); break
@@ -226,7 +221,8 @@ def check_once():
         info = next((c for c in chargers_raw if c['chargerId'] == cid), None)
         if not info:
             prev = state.get(cid, {})
-feat: accurate daily profit from session history API (per-person rates)            state[cid] = {**prev, 'missing_count': miss_count}
+            miss_count = prev.get('missing_count', 0) + 1
+            state[cid] = {**prev, 'missing_count': miss_count}
             if miss_count == 2:
                 ctype = 'DC Fast' if cid.startswith('DC') else 'AC'
                 notify(
@@ -357,7 +353,6 @@ feat: accurate daily profit from session history API (per-person rates)         
                 priority='default', tags='wave'
             )
 
-    # --- Update daily totals from real session history API ---
     profit_data = get_today_profit()
     if profit_data is not None:
         real_profit, real_kwh, real_sessions = profit_data
@@ -369,7 +364,6 @@ feat: accurate daily profit from session history API (per-person rates)         
         if delta > 0:
             state['weekly']['profit'] = round(state['weekly'].get('profit', 0) + delta, 2)
 
-    # Daily profit targets (checked every poll using real data)
     daily_profit = state['daily']['profit']
     if not state['daily'].get('target_5000_sent') and daily_profit >= 5000:
         notify(
@@ -388,7 +382,6 @@ feat: accurate daily profit from session history API (per-person rates)         
         )
         state['daily']['target_10000_sent'] = True
 
-    # 8am heartbeat
     if sl_hour() == 8 and not state['daily'].get('heartbeat_sent'):
         notify(
             title='\u2705 Monitor Running',
@@ -398,7 +391,6 @@ feat: accurate daily profit from session history API (per-person rates)         
         )
         state['daily']['heartbeat_sent'] = True
 
-    # Weekly summary: Monday at 9am SL time
     if datetime.now(SL_TZ).weekday() == 0 and sl_hour() == 9 and not state['weekly'].get('summary_sent'):
         w = state['weekly']
         week_start = w.get('week_start', 'this week')
@@ -410,7 +402,6 @@ feat: accurate daily profit from session history API (per-person rates)         
         )
         state['weekly']['summary_sent'] = True
 
-    # 9pm daily summary
     if sl_hour() == 21 and not state['daily'].get('summary_sent'):
         d = state['daily']
         today_str = datetime.now(SL_TZ).strftime('%d %b %Y')
