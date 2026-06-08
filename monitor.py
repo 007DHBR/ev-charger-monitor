@@ -11,7 +11,6 @@ OWNER_ID = 27
 CHARGERS = ['DC020', 'AC007']
 STATE_FILE = 'state.json'
 POLL_INTERVAL = 30
-LOOP_DURATION = 270
 
 SL_TZ = timezone(timedelta(hours=5, minutes=30))
 
@@ -40,11 +39,11 @@ def login():
                     result = data.get('result', {})
                     token = result.get('token') if isinstance(result, dict) else None
                     if token:
-                        print(f'[login] OK via {base}{path}')
+                        print(f'[login] OK via {base}{path}', flush=True)
                         _token, _base = token, base
                         return True
             except Exception as e:
-                print(f'[login] {base}{path}: {e}')
+                print(f'[login] {base}{path}: {e}', flush=True)
     return False
 
 def get_charger_status():
@@ -98,11 +97,11 @@ def get_today_profit():
                         total_profit += float(session.get('profit', 0) or 0)
                         total_kwh += float(session.get('usedKwh', 0) or 0)
                         total_sessions += 1
-            print(f'[profit] Today: {total_sessions} sessions, {round(total_kwh,2)} kWh, Rs {round(total_profit,2)}')
+            print(f'[profit] Today: {total_sessions} sessions, {round(total_kwh,2)} kWh, Rs {round(total_profit,2)}', flush=True)
             return (round(total_profit, 2), round(total_kwh, 3), total_sessions)
         except Exception as e:
-            print(f'[profit] {base}: {e}')
-    print('[profit] All bases failed \u2014 using accumulated state')
+            print(f'[profit] {base}: {e}', flush=True)
+    print('[profit] All bases failed \u2014 using accumulated state', flush=True)
     return None
 
 def extract_kwh(session):
@@ -154,9 +153,9 @@ def notify(title, body, tags='electric_plug', priority='high'):
             headers={'Title': title, 'Tags': tags, 'Priority': priority,
                      'Content-Type': 'text/plain; charset=utf-8'},
             timeout=15)
-        print(f'[notify] {title} -> HTTP {r.status_code}')
+        print(f'[notify] {title} -> HTTP {r.status_code}', flush=True)
     except Exception as e:
-        print(f'[notify] error: {e}')
+        print(f'[notify] error: {e}', flush=True)
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -209,7 +208,7 @@ def ensure_weekly(state):
 def check_once():
     chargers_raw = get_charger_status()
     if not chargers_raw:
-        print('[check] No charger data'); return
+        print('[check] No charger data', flush=True); return
 
     state = load_state()
     state = ensure_daily(state)
@@ -253,11 +252,10 @@ def check_once():
 
         prev = state.get(cid, {})
         prev_status = prev.get('status', 'Unknown')
-        print(f'[{cid}] {prev_status} -> {status}')
+        print(f'[{cid}] {prev_status} -> {status}', flush=True)
 
         if status == 'Charging' and prev_status != 'Charging':
             prev['charge_start_ts'] = now_ts
-            print(f'[{cid}] charge_start_ts recorded')
 
         if status == 'Charging':
             session = get_active_session(cid)
@@ -312,16 +310,10 @@ def check_once():
         elif status in ('Finishing', 'Available') and prev_status in ('Charging', 'Finishing', 'Preparing'):
             charge_start_ts = prev.get('charge_start_ts')
             session_duration = (now_ts - charge_start_ts) if charge_start_ts else None
-
             session = get_active_session(cid)
             kwh = extract_kwh(session) or prev.get('last_kwh')
             profit = extract_profit(session) or prev.get('last_profit')
-
-            is_bms_error = (
-                session_duration is not None and
-                session_duration < BMS_ERROR_THRESHOLD_SECONDS
-            )
-
+            is_bms_error = (session_duration is not None and session_duration < BMS_ERROR_THRESHOLD_SECONDS)
             if is_bms_error:
                 notify(
                     title=f'\u26a0\ufe0f {cid} - BMS ERROR',
@@ -341,7 +333,6 @@ def check_once():
                     body=chr(10).join(lines),
                     tags='battery,moneybag'
                 )
-
             state[cid].pop('last_kwh', None)
             state[cid].pop('last_profit', None)
             state[cid].pop('charge_start_ts', None)
@@ -368,17 +359,15 @@ def check_once():
     if not state['daily'].get('target_5000_sent') and daily_profit >= 5000:
         notify(
             title='\U0001f3af Daily Target \u2014 Rs. 5,000!',
-            body=f"Today's profit has reached Rs. 5,000! Keep it up.\nTotal so far: Rs. {daily_profit}",
-            tags='dart,moneybag',
-            priority='high'
+            body=f"Today's profit has reached Rs. 5,000!\nTotal so far: Rs. {daily_profit}",
+            tags='dart,moneybag', priority='high'
         )
         state['daily']['target_5000_sent'] = True
     if not state['daily'].get('target_10000_sent') and daily_profit >= 10000:
         notify(
             title='\U0001f525 Daily Target \u2014 Rs. 10,000!',
             body=f"Incredible! Daily profit has reached Rs. 10,000!\nTotal today: Rs. {daily_profit}",
-            tags='fire,moneybag',
-            priority='urgent'
+            tags='fire,moneybag', priority='urgent'
         )
         state['daily']['target_10000_sent'] = True
 
@@ -386,19 +375,16 @@ def check_once():
         notify(
             title='\u2705 Monitor Running',
             body='EV charger monitor is active. Both chargers are being watched.',
-            tags='white_check_mark',
-            priority='default'
+            tags='white_check_mark', priority='default'
         )
         state['daily']['heartbeat_sent'] = True
 
     if datetime.now(SL_TZ).weekday() == 0 and sl_hour() == 9 and not state['weekly'].get('summary_sent'):
         w = state['weekly']
-        week_start = w.get('week_start', 'this week')
         notify(
             title='\U0001f4ca Weekly Summary',
-            body=f"Week of {week_start}\nSessions: {w['sessions']}\nEnergy: {w['kwh']} kWh\nProfit: Rs. {w['profit']}",
-            tags='bar_chart,moneybag',
-            priority='default'
+            body=f"Week of {w.get('week_start','this week')}\nSessions: {w['sessions']}\nEnergy: {w['kwh']} kWh\nProfit: Rs. {w['profit']}",
+            tags='bar_chart,moneybag', priority='default'
         )
         state['weekly']['summary_sent'] = True
 
@@ -408,40 +394,42 @@ def check_once():
         notify(
             title=f'Daily Report - {today_str}',
             body=f"Daily summary for {today_str}\nTotal sessions: {d['sessions']}\nTotal energy: {d['kwh']} kWh\nTotal profit: Rs {d['profit']}",
-            tags='bar_chart,moneybag',
-            priority='default'
+            tags='bar_chart,moneybag', priority='default'
         )
         state['daily']['summary_sent'] = True
 
     save_state(state)
 
 def main():
-    if not login():
-        print('[main] Login failed'); sys.exit(1)
+    print('[main] EV Charger Monitor starting...', flush=True)
+    # Keep retrying login until it succeeds
+    while not login():
+        print('[main] Login failed, retrying in 60s...', flush=True)
+        time.sleep(60)
 
-    start = time.time()
     iteration = 0
+    last_login = time.time()
 
     while True:
         iteration += 1
-        elapsed = time.time() - start
-        print(f'--- Check #{iteration} (elapsed {int(elapsed)}s) [{datetime.now(SL_TZ).strftime("%H:%M:%S")} SL] ---')
+        print(f'--- Poll #{iteration} [{datetime.now(SL_TZ).strftime("%H:%M:%S")} SL] ---', flush=True)
 
         try:
             check_once()
         except Exception as e:
-            print(f'[check] Error: {e}')
+            print(f'[check] Error: {e}', flush=True)
             if not login():
-                print('[main] Re-login failed, stopping'); break
+                print('[main] Re-login failed, waiting 60s...', flush=True)
+                time.sleep(60)
+                continue
 
-        elapsed = time.time() - start
-        if elapsed >= LOOP_DURATION:
-            print(f'[main] Done ({int(elapsed)}s)'); break
+        # Re-login every 6 hours to keep token fresh
+        if time.time() - last_login > 21600:
+            print('[main] Refreshing token...', flush=True)
+            if login():
+                last_login = time.time()
 
-        sleep_time = POLL_INTERVAL - (time.time() - start - (iteration - 1) * POLL_INTERVAL)
-        if sleep_time > 0:
-            print(f'[main] Sleeping {int(sleep_time)}s...')
-            time.sleep(sleep_time)
+        time.sleep(POLL_INTERVAL)
 
 if __name__ == '__main__':
     main()
