@@ -1,16 +1,26 @@
 {
   "DC020": {
     "status": "Available",
-    "updated": "2026-06-07T18:22:57.933989+00:00",
+    "updated": "2026-06-08T06:19:18.409248+00:00",
     "missing_count": 0
   },
   "AC007": {
     "status": "Available",
-    "updated": "2026-06-07T18:22:57.933989+00:00",
+    "updated": "2026-06-08T06:19:18.409248+00:00",
     "missing_count": 0
   },
   "daily": {
-    "date": "2026-06-07",
+    "date": "2026-06-08",
+    "kwh": 0.0,
+    "profit": 0.0,
+    "sessions": 0,
+    "summary_sent": false,
+    "heartbeat_sent": false,
+    "target_5000_sent": false,
+    "target_10000_sent": false
+  },
+  "weekly": {
+    "week_start": "2026-06-08",
     "kwh": 0.0,
     "profit": 0.0,
     "sessions": 0,
